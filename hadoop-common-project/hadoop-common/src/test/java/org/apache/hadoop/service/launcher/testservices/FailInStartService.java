@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -16,26 +16,22 @@
  * limitations under the License.
  */
 
-package org.apache.hadoop.fs.swift.http;
-
-import org.apache.commons.httpclient.methods.EntityEnclosingMethod;
+package org.apache.hadoop.service.launcher.testservices;
 
 /**
- * Implementation for SwiftRestClient to make copy requests.
- * COPY is a method that came with WebDAV (RFC2518), and is not something that
- * can be handled by all proxies en-route to a filesystem.
+ * Service which fails in its start() operation.
  */
-class CopyMethod extends EntityEnclosingMethod {
+public class FailInStartService extends FailureTestService {
+  public static final String NAME =
+      "org.apache.hadoop.service.launcher.testservices.FailInStartService";
+  public static final int EXIT_CODE = -2;
 
-  public CopyMethod(String uri) {
-    super(uri);
+  public FailInStartService() {
+    super(false, true, false, 0);
   }
 
-  /**
-   * @return http method name
-   */
   @Override
-  public String getName() {
-    return "COPY";
+  int getExitCode() {
+    return EXIT_CODE;
   }
 }

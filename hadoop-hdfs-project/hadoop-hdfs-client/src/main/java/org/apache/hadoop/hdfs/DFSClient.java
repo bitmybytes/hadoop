@@ -101,6 +101,7 @@ import org.apache.hadoop.hdfs.client.impl.DfsClientConf;
 import org.apache.hadoop.hdfs.client.impl.LeaseRenewer;
 import org.apache.hadoop.hdfs.net.Peer;
 import org.apache.hadoop.hdfs.protocol.AclException;
+import org.apache.hadoop.hdfs.protocol.AddingECPolicyResponse;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.protocol.CacheDirectiveEntry;
 import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo;
@@ -231,7 +232,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   private static ThreadPoolExecutor HEDGED_READ_THREAD_POOL;
   private static volatile ThreadPoolExecutor STRIPED_READ_THREAD_POOL;
   private final int smallBufferSize;
-  private URI keyProviderUri = null;
 
   public DfsClientConf getConf() {
     return dfsClientConf;
@@ -2763,6 +2763,12 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     }
   }
 
+  public AddingECPolicyResponse[] addErasureCodingPolicies(
+      ErasureCodingPolicy[] policies) throws IOException {
+    checkOpen();
+    return namenode.addErasureCodingPolicies(policies);
+  }
+
   public DFSInotifyEventInputStream getInotifyEventStream() throws IOException {
     checkOpen();
     return new DFSInotifyEventInputStream(namenode, tracer);
@@ -2851,9 +2857,12 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     }
     synchronized (DFSClient.class) {
       if (STRIPED_READ_THREAD_POOL == null) {
-        STRIPED_READ_THREAD_POOL = DFSUtilClient.getThreadPoolExecutor(1,
+        // Only after thread pool is fully constructed then save it to
+        // volatile field.
+        ThreadPoolExecutor threadPool = DFSUtilClient.getThreadPoolExecutor(1,
             numThreads, 60, "StripedRead-", true);
-        STRIPED_READ_THREAD_POOL.allowCoreThreadTimeOut(true);
+        threadPool.allowCoreThreadTimeOut(true);
+        STRIPED_READ_THREAD_POOL = threadPool;
       }
     }
   }
@@ -2894,10 +2903,7 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
    * @throws IOException
    */
   URI getKeyProviderUri() throws IOException {
-    if (keyProviderUri != null) {
-      return keyProviderUri;
-    }
-
+    URI keyProviderUri = null;
     // Lookup the secret in credentials object for namenodeuri.
     Credentials credentials = ugi.getCredentials();
     byte[] keyProviderUriBytes = credentials.getSecretKey(getKeyProviderMapKey());
@@ -2929,14 +2935,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     return clientContext.getKeyProviderCache().get(conf, getKeyProviderUri());
   }
 
-  /*
-   * Should be used only for testing.
-   */
-  @VisibleForTesting
-  public void setKeyProviderUri(URI providerUri) {
-    this.keyProviderUri = providerUri;
-  }
-
   @VisibleForTesting
   public void setKeyProvider(KeyProvider provider) {
     clientContext.getKeyProviderCache().setKeyProvider(conf, provider);
@@ -2944,24 +2942,10 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
 
   /**
    * Probe for encryption enabled on this filesystem.
-   * Note (see HDFS-11689):
-   * Not to throw exception in this method since it would break hive.
-   * Hive accesses this method and assumes no exception would be thrown.
-   * Hive should not access DFSClient since it is InterfaceAudience.Private.
-   * Deprecated annotation is added to trigger build warning at hive side.
-   * Request has been made to Hive to remove access to DFSClient.
    * @return true if encryption is enabled
    */
-  @Deprecated
-  public boolean isHDFSEncryptionEnabled() {
-    boolean result = false;
-    try {
-      result = (getKeyProviderUri() != null);
-    } catch (IOException ioe) {
-      DFSClient.LOG.warn("Exception while checking whether encryption zone "
-            + "is supported, assumes it is not supported", ioe);
-    }
-    return result;
+  boolean isHDFSEncryptionEnabled() throws IOException {
+    return getKeyProviderUri() != null;
   }
 
   /**

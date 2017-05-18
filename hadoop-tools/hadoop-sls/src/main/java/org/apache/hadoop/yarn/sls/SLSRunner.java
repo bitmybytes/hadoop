@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.Collections;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.fasterxml.jackson.core.JsonFactory;
@@ -69,12 +70,15 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo.FifoScheduler;
-import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 import org.apache.hadoop.yarn.sls.appmaster.AMSimulator;
 import org.apache.hadoop.yarn.sls.conf.SLSConfiguration;
 import org.apache.hadoop.yarn.sls.nodemanager.NMSimulator;
 import org.apache.hadoop.yarn.sls.resourcemanager.MockAMLauncher;
-import org.apache.hadoop.yarn.sls.scheduler.*;
+import org.apache.hadoop.yarn.sls.scheduler.SLSCapacityScheduler;
+import org.apache.hadoop.yarn.sls.scheduler.TaskRunner;
+import org.apache.hadoop.yarn.sls.scheduler.SLSFairScheduler;
+import org.apache.hadoop.yarn.sls.scheduler.ContainerSimulator;
+import org.apache.hadoop.yarn.sls.scheduler.SchedulerWrapper;
 import org.apache.hadoop.yarn.sls.synthetic.SynthJob;
 import org.apache.hadoop.yarn.sls.synthetic.SynthTraceJobProducer;
 import org.apache.hadoop.yarn.sls.utils.SLSUtils;
@@ -110,11 +114,17 @@ public class SLSRunner extends Configured implements Tool {
   // other simulation information
   private int numNMs, numRacks, numAMs, numTasks;
   private long maxRuntime;
-  public final static Map<String, Object> simulateInfoMap =
+
+  private final static Map<String, Object> simulateInfoMap =
           new HashMap<String, Object>();
 
   // logger
   public final static Logger LOG = Logger.getLogger(SLSRunner.class);
+
+  private final static int DEFAULT_MAPPER_PRIORITY = 20;
+  private final static int DEFAULT_REDUCER_PRIORITY = 10;
+
+  private static boolean exitAtTheFinish = false;
 
   /**
    * The type of trace in input.
@@ -159,6 +169,13 @@ public class SLSRunner extends Configured implements Tool {
     }
   }
 
+  /**
+   * @return an unmodifiable view of the simulated info map.
+   */
+  public static Map<String, Object> getSimulateInfoMap() {
+    return Collections.unmodifiableMap(simulateInfoMap);
+  }
+
   public void setSimulationParams(TraceType inType, String[] inTraces,
       String nodes, String outDir, Set<String> trackApps,
       boolean printsimulation) throws IOException, ClassNotFoundException {
@@ -197,10 +214,6 @@ public class SLSRunner extends Configured implements Tool {
     Configuration rmConf = new YarnConfiguration(getConf());
     String schedulerClass = rmConf.get(YarnConfiguration.RM_SCHEDULER);
 
-    // For CapacityScheduler we use a sub-classing instead of wrapping
-    // to allow scheduler-specific invocations from monitors to work
-    // this can be used for other schedulers as well if we care to
-    // exercise/track behaviors that are not common to the scheduler api
     if (Class.forName(schedulerClass) == CapacityScheduler.class) {
       rmConf.set(YarnConfiguration.RM_SCHEDULER,
           SLSCapacityScheduler.class.getName());
@@ -248,8 +261,8 @@ public class SLSRunner extends Configured implements Tool {
           break;
         case SYNTH:
           stjp = new SynthTraceJobProducer(getConf(), new Path(inputTraces[0]));
-          nodeSet.addAll(SLSUtils.generateNodesFromSynth(stjp.getNumNodes(),
-              stjp.getNodesPerRack()));
+          nodeSet.addAll(SLSUtils.generateNodes(stjp.getNumNodes(),
+              stjp.getNumNodes()/stjp.getNodesPerRack()));
           break;
         default:
           throw new YarnException("Input configuration not recognized, "
@@ -258,6 +271,10 @@ public class SLSRunner extends Configured implements Tool {
       }
     } else {
       nodeSet.addAll(SLSUtils.parseNodesFromNodeFile(nodeFile));
+    }
+
+    if (nodeSet.size() == 0) {
+      throw new YarnException("No node! Please configure nodes.");
     }
 
     // create NM simulators
@@ -300,226 +317,248 @@ public class SLSRunner extends Configured implements Tool {
 
   @SuppressWarnings("unchecked")
   private void startAM() throws YarnException, IOException {
-    // application/container configuration
-    int heartbeatInterval =
-        getConf().getInt(SLSConfiguration.AM_HEARTBEAT_INTERVAL_MS,
-            SLSConfiguration.AM_HEARTBEAT_INTERVAL_MS_DEFAULT);
-    int containerMemoryMB =
-        getConf().getInt(SLSConfiguration.CONTAINER_MEMORY_MB,
-            SLSConfiguration.CONTAINER_MEMORY_MB_DEFAULT);
-    int containerVCores = getConf().getInt(SLSConfiguration.CONTAINER_VCORES,
-        SLSConfiguration.CONTAINER_VCORES_DEFAULT);
-    Resource containerResource =
-        BuilderUtils.newResource(containerMemoryMB, containerVCores);
-
-    // application workload
     switch (inputType) {
     case SLS:
-      startAMFromSLSTraces(containerResource, heartbeatInterval);
+      for (String inputTrace : inputTraces) {
+        startAMFromSLSTrace(inputTrace);
+      }
       break;
     case RUMEN:
-      startAMFromRumenTraces(containerResource, heartbeatInterval);
+      long baselineTimeMS = 0;
+      for (String inputTrace : inputTraces) {
+        startAMFromRumenTrace(inputTrace, baselineTimeMS);
+      }
       break;
     case SYNTH:
-      startAMFromSynthGenerator(heartbeatInterval);
+      startAMFromSynthGenerator();
       break;
     default:
       throw new YarnException("Input configuration not recognized, "
           + "trace type should be SLS, RUMEN, or SYNTH");
     }
+
     numAMs = amMap.size();
     remainingApps = numAMs;
   }
 
   /**
-   * parse workload information from sls trace files
+   * Parse workload from a SLS trace file.
    */
   @SuppressWarnings("unchecked")
-  private void startAMFromSLSTraces(Resource containerResource,
-      int heartbeatInterval) throws IOException {
-    // parse from sls traces
+  private void startAMFromSLSTrace(String inputTrace) throws IOException {
     JsonFactory jsonF = new JsonFactory();
     ObjectMapper mapper = new ObjectMapper();
-    for (String inputTrace : inputTraces) {
-      Reader input =
-          new InputStreamReader(new FileInputStream(inputTrace), "UTF-8");
-      try {
-        Iterator<Map> i =
-            mapper.readValues(jsonF.createParser(input), Map.class);
-        while (i.hasNext()) {
-          Map jsonJob = i.next();
 
-          // load job information
-          long jobStartTime =
-              Long.parseLong(jsonJob.get("job.start.ms").toString());
-          long jobFinishTime =
-              Long.parseLong(jsonJob.get("job.end.ms").toString());
+    try (Reader input = new InputStreamReader(
+        new FileInputStream(inputTrace), "UTF-8")) {
+      Iterator<Map> jobIter = mapper.readValues(
+          jsonF.createParser(input), Map.class);
 
-          String user = (String) jsonJob.get("job.user");
-          if (user == null) {
-            user = "default";
-          }
-          String queue = jsonJob.get("job.queue.name").toString();
-
-          String oldAppId = jsonJob.get("job.id").toString();
-          boolean isTracked = trackedApps.contains(oldAppId);
-          int queueSize =
-              queueAppNumMap.containsKey(queue) ? queueAppNumMap.get(queue) : 0;
-          queueSize++;
-          queueAppNumMap.put(queue, queueSize);
-          // tasks
-          List tasks = (List) jsonJob.get("job.tasks");
-          if (tasks == null || tasks.size() == 0) {
-            continue;
-          }
-          List<ContainerSimulator> containerList =
-              new ArrayList<ContainerSimulator>();
-          for (Object o : tasks) {
-            Map jsonTask = (Map) o;
-            String hostname = jsonTask.get("container.host").toString();
-            long taskStart =
-                Long.parseLong(jsonTask.get("container.start.ms").toString());
-            long taskFinish =
-                Long.parseLong(jsonTask.get("container.end.ms").toString());
-            long lifeTime = taskFinish - taskStart;
-
-            // Set memory and vcores from job trace file
-            Resource res = Resources.clone(containerResource);
-            if (jsonTask.containsKey("container.memory")) {
-              int containerMemory =
-                  Integer.parseInt(jsonTask.get("container.memory").toString());
-              res.setMemorySize(containerMemory);
-            }
-
-            if (jsonTask.containsKey("container.vcores")) {
-              int containerVCores =
-                  Integer.parseInt(jsonTask.get("container.vcores").toString());
-              res.setVirtualCores(containerVCores);
-            }
-
-            int priority =
-                Integer.parseInt(jsonTask.get("container.priority").toString());
-            String type = jsonTask.get("container.type").toString();
-            containerList.add(new ContainerSimulator(res, lifeTime, hostname,
-                priority, type));
-          }
-
-          // create a new AM
-          String amType = jsonJob.get("am.type").toString();
-          AMSimulator amSim = (AMSimulator) ReflectionUtils
-              .newInstance(amClassMap.get(amType), new Configuration());
-          if (amSim != null) {
-            amSim.init(AM_ID++, heartbeatInterval, containerList, rm, this,
-                jobStartTime, jobFinishTime, user, queue, isTracked, oldAppId,
-                null, runner.getStartTimeMS());
-            runner.schedule(amSim);
-            maxRuntime = Math.max(maxRuntime, jobFinishTime);
-            numTasks += containerList.size();
-            amMap.put(oldAppId, amSim);
-          }
+      while (jobIter.hasNext()) {
+        try {
+          createAMForJob(jobIter.next());
+        } catch (Exception e) {
+          LOG.error("Failed to create an AM: " + e.getMessage());
         }
-      } finally {
-        input.close();
       }
     }
   }
 
-  /**
-   * parse workload information from rumen trace files
-   */
-  @SuppressWarnings("unchecked")
-  private void startAMFromRumenTraces(Resource containerResource,
-      int heartbeatInterval) throws IOException {
-    Configuration conf = new Configuration();
-    conf.set("fs.defaultFS", "file:///");
-    long baselineTimeMS = 0;
-    for (String inputTrace : inputTraces) {
-      File fin = new File(inputTrace);
-      JobTraceReader reader =
-          new JobTraceReader(new Path(fin.getAbsolutePath()), conf);
-      try {
-        LoggedJob job = null;
-        while ((job = reader.getNext()) != null) {
-          // only support MapReduce currently
-          String jobType = "mapreduce";
-          String user =
-              job.getUser() == null ? "default" : job.getUser().getValue();
-          String jobQueue = job.getQueue().getValue();
-          String oldJobId = job.getJobID().toString();
-          long jobStartTimeMS = job.getSubmitTime();
-          long jobFinishTimeMS = job.getFinishTime();
-          if (baselineTimeMS == 0) {
-            baselineTimeMS = jobStartTimeMS;
-          }
-          jobStartTimeMS -= baselineTimeMS;
-          jobFinishTimeMS -= baselineTimeMS;
-          if (jobStartTimeMS < 0) {
-            LOG.warn("Warning: reset job " + oldJobId + " start time to 0.");
-            jobFinishTimeMS = jobFinishTimeMS - jobStartTimeMS;
-            jobStartTimeMS = 0;
-          }
+  private void createAMForJob(Map jsonJob) throws YarnException {
+    long jobStartTime = Long.parseLong(jsonJob.get("job.start.ms").toString());
 
-          boolean isTracked = trackedApps.contains(oldJobId);
-          int queueSize = queueAppNumMap.containsKey(jobQueue)
-              ? queueAppNumMap.get(jobQueue) : 0;
-          queueSize++;
-          queueAppNumMap.put(jobQueue, queueSize);
+    long jobFinishTime = 0;
+    if (jsonJob.containsKey("job.end.ms")) {
+      jobFinishTime = Long.parseLong(jsonJob.get("job.end.ms").toString());
+    }
 
-          List<ContainerSimulator> containerList =
-              new ArrayList<ContainerSimulator>();
-          // map tasks
-          for (LoggedTask mapTask : job.getMapTasks()) {
-            if (mapTask.getAttempts().size() == 0) {
-              continue;
-            }
-            LoggedTaskAttempt taskAttempt =
-                mapTask.getAttempts().get(mapTask.getAttempts().size() - 1);
-            String hostname = taskAttempt.getHostName().getValue();
-            long containerLifeTime =
-                taskAttempt.getFinishTime() - taskAttempt.getStartTime();
-            containerList.add(new ContainerSimulator(containerResource,
-                containerLifeTime, hostname, 10, "map"));
-          }
+    String user = (String) jsonJob.get("job.user");
+    if (user == null) {
+      user = "default";
+    }
 
-          // reduce tasks
-          for (LoggedTask reduceTask : job.getReduceTasks()) {
-            if (reduceTask.getAttempts().size() == 0) {
-              continue;
-            }
-            LoggedTaskAttempt taskAttempt = reduceTask.getAttempts()
-                .get(reduceTask.getAttempts().size() - 1);
-            String hostname = taskAttempt.getHostName().getValue();
-            long containerLifeTime =
-                taskAttempt.getFinishTime() - taskAttempt.getStartTime();
-            containerList.add(new ContainerSimulator(containerResource,
-                containerLifeTime, hostname, 20, "reduce"));
-          }
+    String queue = jsonJob.get("job.queue.name").toString();
+    increaseQueueAppNum(queue);
 
-          // create a new AM
-          AMSimulator amSim = (AMSimulator) ReflectionUtils
-              .newInstance(amClassMap.get(jobType), conf);
-          if (amSim != null) {
-            amSim.init(AM_ID++, heartbeatInterval, containerList, rm, this,
-                jobStartTimeMS, jobFinishTimeMS, user, jobQueue, isTracked,
-                oldJobId, null, runner.getStartTimeMS());
-            runner.schedule(amSim);
-            maxRuntime = Math.max(maxRuntime, jobFinishTimeMS);
-            numTasks += containerList.size();
-            amMap.put(oldJobId, amSim);
-          }
-        }
-      } finally {
-        reader.close();
+    String oldAppId = (String)jsonJob.get("job.id");
+    if (oldAppId == null) {
+      oldAppId = Integer.toString(AM_ID);
+    }
+
+    String amType = (String)jsonJob.get("am.type");
+    if (amType == null) {
+      amType = SLSUtils.DEFAULT_JOB_TYPE;
+    }
+
+    runNewAM(amType, user, queue, oldAppId, jobStartTime, jobFinishTime,
+        getTaskContainers(jsonJob), null);
+  }
+
+  private List<ContainerSimulator> getTaskContainers(Map jsonJob)
+      throws YarnException {
+    List<ContainerSimulator> containers = new ArrayList<>();
+    List tasks = (List) jsonJob.get("job.tasks");
+    if (tasks == null || tasks.size() == 0) {
+      throw new YarnException("No task for the job!");
+    }
+
+    for (Object o : tasks) {
+      Map jsonTask = (Map) o;
+
+      String hostname = (String) jsonTask.get("container.host");
+
+      long duration = 0;
+      if (jsonTask.containsKey("duration.ms")) {
+        duration = Integer.parseInt(jsonTask.get("duration.ms").toString());
+      } else if (jsonTask.containsKey("container.start.ms") &&
+          jsonTask.containsKey("container.end.ms")) {
+        long taskStart = Long.parseLong(jsonTask.get("container.start.ms")
+            .toString());
+        long taskFinish = Long.parseLong(jsonTask.get("container.end.ms")
+            .toString());
+        duration = taskFinish - taskStart;
+      }
+      if (duration <= 0) {
+        throw new YarnException("Duration of a task shouldn't be less or equal"
+            + " to 0!");
+      }
+
+      Resource res = getDefaultContainerResource();
+      if (jsonTask.containsKey("container.memory")) {
+        int containerMemory =
+            Integer.parseInt(jsonTask.get("container.memory").toString());
+        res.setMemorySize(containerMemory);
+      }
+
+      if (jsonTask.containsKey("container.vcores")) {
+        int containerVCores =
+            Integer.parseInt(jsonTask.get("container.vcores").toString());
+        res.setVirtualCores(containerVCores);
+      }
+
+      int priority = DEFAULT_MAPPER_PRIORITY;
+      if (jsonTask.containsKey("container.priority")) {
+        priority = Integer.parseInt(jsonTask.get("container.priority")
+            .toString());
+      }
+
+      String type = "map";
+      if (jsonTask.containsKey("container.type")) {
+        type = jsonTask.get("container.type").toString();
+      }
+
+      int count = 1;
+      if (jsonTask.containsKey("count")) {
+        count = Integer.parseInt(jsonTask.get("count").toString());
+      }
+      count = Math.max(count, 1);
+
+      for (int i = 0; i < count; i++) {
+        containers.add(
+            new ContainerSimulator(res, duration, hostname, priority, type));
       }
     }
+
+    return containers;
+  }
+
+  /**
+   * Parse workload from a rumen trace file.
+   */
+  @SuppressWarnings("unchecked")
+  private void startAMFromRumenTrace(String inputTrace, long baselineTimeMS)
+      throws IOException {
+    Configuration conf = new Configuration();
+    conf.set("fs.defaultFS", "file:///");
+    File fin = new File(inputTrace);
+
+    try (JobTraceReader reader = new JobTraceReader(
+        new Path(fin.getAbsolutePath()), conf)) {
+      LoggedJob job = reader.getNext();
+
+      while (job != null) {
+        try {
+          createAMForJob(job, baselineTimeMS);
+        } catch (Exception e) {
+          LOG.error("Failed to create an AM: " + e.getMessage());
+        }
+
+        job = reader.getNext();
+      }
+    }
+  }
+
+  private void createAMForJob(LoggedJob job, long baselineTimeMs)
+      throws YarnException {
+    String user = job.getUser() == null ? "default" :
+        job.getUser().getValue();
+    String jobQueue = job.getQueue().getValue();
+    String oldJobId = job.getJobID().toString();
+    long jobStartTimeMS = job.getSubmitTime();
+    long jobFinishTimeMS = job.getFinishTime();
+    if (baselineTimeMs == 0) {
+      baselineTimeMs = job.getSubmitTime();
+    }
+    jobStartTimeMS -= baselineTimeMs;
+    jobFinishTimeMS -= baselineTimeMs;
+    if (jobStartTimeMS < 0) {
+      LOG.warn("Warning: reset job " + oldJobId + " start time to 0.");
+      jobFinishTimeMS = jobFinishTimeMS - jobStartTimeMS;
+      jobStartTimeMS = 0;
+    }
+
+    increaseQueueAppNum(jobQueue);
+
+    List<ContainerSimulator> containerList = new ArrayList<>();
+    // mapper
+    for (LoggedTask mapTask : job.getMapTasks()) {
+      if (mapTask.getAttempts().size() == 0) {
+        throw new YarnException("Invalid map task, no attempt for a mapper!");
+      }
+      LoggedTaskAttempt taskAttempt =
+          mapTask.getAttempts().get(mapTask.getAttempts().size() - 1);
+      String hostname = taskAttempt.getHostName().getValue();
+      long containerLifeTime = taskAttempt.getFinishTime() -
+          taskAttempt.getStartTime();
+      containerList.add(
+          new ContainerSimulator(getDefaultContainerResource(),
+              containerLifeTime, hostname, DEFAULT_MAPPER_PRIORITY, "map"));
+    }
+
+    // reducer
+    for (LoggedTask reduceTask : job.getReduceTasks()) {
+      if (reduceTask.getAttempts().size() == 0) {
+        throw new YarnException(
+            "Invalid reduce task, no attempt for a reducer!");
+      }
+      LoggedTaskAttempt taskAttempt =
+          reduceTask.getAttempts().get(reduceTask.getAttempts().size() - 1);
+      String hostname = taskAttempt.getHostName().getValue();
+      long containerLifeTime = taskAttempt.getFinishTime() -
+          taskAttempt.getStartTime();
+      containerList.add(
+          new ContainerSimulator(getDefaultContainerResource(),
+              containerLifeTime, hostname, DEFAULT_REDUCER_PRIORITY, "reduce"));
+    }
+
+    // Only supports the default job type currently
+    runNewAM(SLSUtils.DEFAULT_JOB_TYPE, user, jobQueue, oldJobId,
+        jobStartTimeMS, jobFinishTimeMS, containerList, null);
+  }
+
+  private Resource getDefaultContainerResource() {
+    int containerMemory = getConf().getInt(SLSConfiguration.CONTAINER_MEMORY_MB,
+        SLSConfiguration.CONTAINER_MEMORY_MB_DEFAULT);
+    int containerVCores = getConf().getInt(SLSConfiguration.CONTAINER_VCORES,
+        SLSConfiguration.CONTAINER_VCORES_DEFAULT);
+    return Resources.createResource(containerMemory, containerVCores);
   }
 
   /**
    * parse workload information from synth-generator trace files.
    */
   @SuppressWarnings("unchecked")
-  private void startAMFromSynthGenerator(int heartbeatInterval)
-      throws IOException {
+  private void startAMFromSynthGenerator() throws YarnException, IOException {
     Configuration localConf = new Configuration();
     localConf.set("fs.defaultFS", "file:///");
     long baselineTimeMS = 0;
@@ -540,7 +579,6 @@ public class SLSRunner extends Configured implements Tool {
       // creation
       while ((job = (SynthJob) stjp.getNextJob()) != null) {
         // only support MapReduce currently
-        String jobType = "mapreduce";
         String user = job.getUser();
         String jobQueue = job.getQueueName();
         String oldJobId = job.getJobID().toString();
@@ -560,11 +598,7 @@ public class SLSRunner extends Configured implements Tool {
           jobStartTimeMS = 0;
         }
 
-        boolean isTracked = trackedApps.contains(oldJobId);
-        int queueSize = queueAppNumMap.containsKey(jobQueue)
-            ? queueAppNumMap.get(jobQueue) : 0;
-        queueSize++;
-        queueAppNumMap.put(jobQueue, queueSize);
+        increaseQueueAppNum(jobQueue);
 
         List<ContainerSimulator> containerList =
             new ArrayList<ContainerSimulator>();
@@ -584,7 +618,7 @@ public class SLSRunner extends Configured implements Tool {
               Resource.newInstance((int) tai.getTaskInfo().getTaskMemory(),
                   (int) tai.getTaskInfo().getTaskVCores());
           containerList.add(new ContainerSimulator(containerResource,
-              containerLifeTime, hostname, 10, "map"));
+              containerLifeTime, hostname, DEFAULT_MAPPER_PRIORITY, "map"));
           maxMapRes = Resources.componentwiseMax(maxMapRes, containerResource);
           maxMapDur =
               containerLifeTime > maxMapDur ? containerLifeTime : maxMapDur;
@@ -604,7 +638,7 @@ public class SLSRunner extends Configured implements Tool {
               Resource.newInstance((int) tai.getTaskInfo().getTaskMemory(),
                   (int) tai.getTaskInfo().getTaskVCores());
           containerList.add(new ContainerSimulator(containerResource,
-              containerLifeTime, hostname, 20, "reduce"));
+              containerLifeTime, hostname, DEFAULT_REDUCER_PRIORITY, "reduce"));
           maxRedRes = Resources.componentwiseMax(maxRedRes, containerResource);
           maxRedDur =
               containerLifeTime > maxRedDur ? containerLifeTime : maxRedDur;
@@ -625,23 +659,50 @@ public class SLSRunner extends Configured implements Tool {
               job.getQueueName());
 
         }
-        // create a new AM
-        AMSimulator amSim = (AMSimulator) ReflectionUtils
-            .newInstance(amClassMap.get(jobType), localConf);
-        if (amSim != null) {
-          amSim.init(AM_ID++, heartbeatInterval, containerList, rm, this,
-              jobStartTimeMS, jobFinishTimeMS, user, jobQueue, isTracked,
-              oldJobId, rr, runner.getStartTimeMS());
-          runner.schedule(amSim);
-          maxRuntime = Math.max(maxRuntime, jobFinishTimeMS);
-          numTasks += containerList.size();
-          amMap.put(oldJobId, amSim);
-        }
+
+        runNewAM(SLSUtils.DEFAULT_JOB_TYPE, user, jobQueue, oldJobId,
+            jobStartTimeMS, jobFinishTimeMS, containerList, rr);
       }
     } finally {
       stjp.close();
     }
 
+  }
+
+  private void increaseQueueAppNum(String queue) throws YarnException {
+    SchedulerWrapper wrapper = (SchedulerWrapper)rm.getResourceScheduler();
+    String queueName = wrapper.getRealQueueName(queue);
+    Integer appNum = queueAppNumMap.get(queueName);
+    if (appNum == null) {
+      appNum = 1;
+    } else {
+      appNum++;
+    }
+
+    queueAppNumMap.put(queueName, appNum);
+  }
+
+  private void runNewAM(String jobType, String user,
+      String jobQueue, String oldJobId, long jobStartTimeMS,
+      long jobFinishTimeMS, List<ContainerSimulator> containerList,
+      ReservationSubmissionRequest rr) {
+
+    AMSimulator amSim = (AMSimulator) ReflectionUtils.newInstance(
+        amClassMap.get(jobType), new Configuration());
+
+    if (amSim != null) {
+      int heartbeatInterval = getConf().getInt(
+          SLSConfiguration.AM_HEARTBEAT_INTERVAL_MS,
+          SLSConfiguration.AM_HEARTBEAT_INTERVAL_MS_DEFAULT);
+      boolean isTracked = trackedApps.contains(oldJobId);
+      amSim.init(AM_ID++, heartbeatInterval, containerList,
+          rm, this, jobStartTimeMS, jobFinishTimeMS, user, jobQueue,
+          isTracked, oldJobId, rr, runner.getStartTimeMS());
+      runner.schedule(amSim);
+      maxRuntime = Math.max(maxRuntime, jobFinishTimeMS);
+      numTasks += containerList.size();
+      amMap.put(oldJobId, amSim);
+    }
   }
 
   private void printSimulationInfo() {
@@ -702,6 +763,9 @@ public class SLSRunner extends Configured implements Tool {
 
     if (remainingApps == 0) {
       LOG.info("SLSRunner tears down.");
+      if (exitAtTheFinish) {
+        System.exit(0);
+      }
     }
   }
 
@@ -798,6 +862,7 @@ public class SLSRunner extends Configured implements Tool {
   }
 
   public static void main(String[] argv) throws Exception {
+    exitAtTheFinish = true;
     ToolRunner.run(new Configuration(), new SLSRunner(), argv);
   }
 

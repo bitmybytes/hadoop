@@ -58,7 +58,7 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
   private static final String PROCFS = "/proc/";
 
   private static final Pattern PROCFS_STAT_FILE_FORMAT = Pattern.compile(
-      "^([\\d-]+)\\s\\(([^)]+)\\)\\s[^\\s]\\s([\\d-]+)\\s([\\d-]+)\\s" +
+      "^([\\d-]+)\\s\\((.*)\\)\\s[^\\s]\\s([\\d-]+)\\s([\\d-]+)\\s" +
       "([\\d-]+)\\s([\\d-]+\\s){7}(\\d+)\\s(\\d+)\\s([\\d-]+\\s){7}(\\d+)\\s" +
       "(\\d+)(\\s[\\d-]+){15}");
 
@@ -481,18 +481,21 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
    * Get the list of all processes in the system.
    */
   private List<String> getProcessList() {
-    String[] processDirs = (new File(procfsDir)).list();
     List<String> processList = new ArrayList<String>();
-
-    for (String dir : processDirs) {
-      Matcher m = numberPattern.matcher(dir);
-      if (!m.matches()) continue;
-      try {
-        if ((new File(procfsDir, dir)).isDirectory()) {
-          processList.add(dir);
+    String[] processDirs = (new File(procfsDir)).list();
+    if (processDirs != null) {
+      for (String dir : processDirs) {
+        Matcher m = numberPattern.matcher(dir);
+        if (!m.matches()) {
+          continue;
         }
-      } catch (SecurityException s) {
-        // skip this process
+        try {
+          if ((new File(procfsDir, dir)).isDirectory()) {
+            processList.add(dir);
+          }
+        } catch (SecurityException s) {
+          // skip this process
+        }
       }
     }
     return processList;
